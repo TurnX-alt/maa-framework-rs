@@ -27,6 +27,14 @@ pub struct Controller {
 struct ControllerInner {
     handle: NonNull<sys::MaaController>,
     owns_handle: bool,
+    /// Allocation passed to `MaaCustomControllerCreate` as `trans_arg`.
+    ///
+    /// Native callbacks run on the controller action thread, and synchronously from
+    /// getters such as `MaaControllerConnected` while a caller holds a clone. The
+    /// allocation is freed only after `MaaControllerDestroy` returns: `~ControllerAgent`
+    /// joins the action thread before returning, and Rust ownership keeps the controller
+    /// alive for the duration of synchronous getters.
+    custom_callback_ptr: Option<usize>,
     _retained_handles: Vec<Arc<ControllerInner>>,
     callbacks: Mutex<HashMap<sys::MaaSinkId, usize>>,
     event_sinks: Mutex<HashMap<sys::MaaSinkId, usize>>,
@@ -316,14 +324,29 @@ impl Controller {
         let handle =
             unsafe { sys::MaaCustomControllerCreate(callbacks as *const _ as *mut _, cb_ptr) };
 
-        NonNull::new(handle).map(Self::new_owned).ok_or_else(|| {
+        Self::from_custom_handle(handle, cb_ptr)
+    }
+
+    /// Wraps the result of `MaaCustomControllerCreate`.
+    ///
+    /// Takes ownership of `cb_ptr` in both branches: it is either recorded for release
+    /// after native destroy, or freed immediately when native rejected the handle.
+    #[cfg(feature = "custom")]
+    fn from_custom_handle(handle: *mut sys::MaaController, cb_ptr: *mut c_void) -> MaaResult<Self> {
+        if let Some(ptr) = NonNull::new(handle) {
+            Ok(Self::new_with_retained_and_callback(
+                ptr,
+                Vec::new(),
+                Some(cb_ptr),
+            ))
+        } else {
             unsafe {
                 let _ = Box::from_raw(
                     cb_ptr as *mut Box<dyn crate::custom_controller::CustomControllerCallback>,
                 );
             }
-            MaaError::FrameworkError(-1)
-        })
+            Err(MaaError::FrameworkError(-1))
+        }
     }
 
     /// Helper to create controller from raw handle.
@@ -343,10 +366,19 @@ impl Controller {
         handle: NonNull<sys::MaaController>,
         retained_handles: Vec<Arc<ControllerInner>>,
     ) -> Self {
+        Self::new_with_retained_and_callback(handle, retained_handles, None)
+    }
+
+    fn new_with_retained_and_callback(
+        handle: NonNull<sys::MaaController>,
+        retained_handles: Vec<Arc<ControllerInner>>,
+        custom_callback_ptr: Option<*mut c_void>,
+    ) -> Self {
         Self {
             inner: Arc::new(ControllerInner {
                 handle,
                 owns_handle: true,
+                custom_callback_ptr: custom_callback_ptr.map(|ptr| ptr as usize),
                 _retained_handles: retained_handles,
                 callbacks: Mutex::new(HashMap::new()),
                 event_sinks: Mutex::new(HashMap::new()),
@@ -957,6 +989,13 @@ impl Drop for ControllerInner {
                     crate::callback::EventCallback::drop_sink(ptr as *mut c_void);
                 }
                 sys::MaaControllerDestroy(self.handle.as_ptr());
+                if let Some(ptr) = self.custom_callback_ptr.take() {
+                    // SAFETY: this allocation was created by new_custom and is freed only here,
+                    // after the native controller has been destroyed.
+                    drop(Box::from_raw(
+                        ptr as *mut Box<dyn crate::custom_controller::CustomControllerCallback>,
+                    ));
+                }
             }
         }
     }
@@ -1123,5 +1162,39 @@ impl<'a> ControllerRef<'a> {
     /// Get raw handle.
     pub fn raw(&self) -> *mut sys::MaaController {
         self.handle
+    }
+}
+
+#[cfg(all(test, feature = "custom"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl crate::custom_controller::CustomControllerCallback for DropCounter {
+        fn connect(&self) -> bool {
+            true
+        }
+    }
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn rejected_custom_handle_releases_callback_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let boxed: Box<Box<dyn crate::custom_controller::CustomControllerCallback>> =
+            Box::new(Box::new(DropCounter(drops.clone())));
+        let cb_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        let result = Controller::from_custom_handle(std::ptr::null_mut(), cb_ptr);
+
+        assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&drops), 1);
     }
 }
