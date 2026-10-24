@@ -96,9 +96,19 @@ impl Tasker {
 
     /// Bind a controller to this tasker.
     pub fn bind_controller(&self, ctrl: &crate::controller::Controller) -> MaaResult<()> {
+        // The native tasker stores a raw pointer. The retained clone must change
+        // together with that pointer: if two binds interleave, the native tasker
+        // could end up holding one controller while the slot retains (and later
+        // releases) the other.
+        let mut retained = self.inner.controller.lock().unwrap();
         let ret = unsafe { sys::MaaTaskerBindController(self.inner.handle.as_ptr(), ctrl.raw()) };
         common::check_bool(ret)?;
-        *self.inner.controller.lock().unwrap() = Some(ctrl.clone());
+        *retained = Some(ctrl.clone());
+        debug_assert_eq!(
+            unsafe { sys::MaaTaskerGetController(self.inner.handle.as_ptr()) },
+            ctrl.raw(),
+            "native tasker controller diverged from the retained controller"
+        );
         Ok(())
     }
 

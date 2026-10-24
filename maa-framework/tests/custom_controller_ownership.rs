@@ -342,6 +342,61 @@ fn concurrent_last_owner_drops_release_callback_once() {
 }
 
 #[test]
+fn concurrent_bind_controller_keeps_retention_in_sync() {
+    let counters_a = Arc::new(Counters::default());
+    let counters_b = Arc::new(Counters::default());
+    let a =
+        Controller::new_custom(DropProbe(counters_a.clone())).expect("new_custom should succeed");
+    let b =
+        Controller::new_custom(DropProbe(counters_b.clone())).expect("new_custom should succeed");
+    let tasker = Tasker::new().expect("tasker should be created");
+
+    for _ in 0..50 {
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for ctrl in [a.clone(), b.clone()] {
+            let tasker = tasker.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..20 {
+                    tasker.bind_controller(&ctrl).unwrap();
+                }
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    // bind_controller asserts that the native pointer and the retained clone agree;
+    // reaching the bound controller also proves its callback is still alive.
+    assert!(tasker.controller().unwrap().connected());
+    assert_eq!(
+        counters_a.drops.load(Ordering::SeqCst) + counters_b.drops.load(Ordering::SeqCst),
+        0
+    );
+
+    drop(tasker);
+    assert_eq!(
+        counters_a.drops.load(Ordering::SeqCst) + counters_b.drops.load(Ordering::SeqCst),
+        0,
+        "caller handles still own both callbacks"
+    );
+    drop(a);
+    assert_eq!(
+        counters_a.drops.load(Ordering::SeqCst) + counters_b.drops.load(Ordering::SeqCst),
+        1
+    );
+    drop(b);
+    assert_eq!(
+        counters_a.drops.load(Ordering::SeqCst) + counters_b.drops.load(Ordering::SeqCst),
+        2
+    );
+}
+
+#[test]
 fn failed_connect_releases_callback_once() {
     let counters = Arc::new(Counters::default());
     let controller =
