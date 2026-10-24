@@ -65,14 +65,20 @@ impl Drop for FailingProbe {
 
 #[derive(Default)]
 struct BlockingState {
-    entered: Mutex<bool>,
-    release: Mutex<bool>,
+    gate: Mutex<Gate>,
     wake: Condvar,
     connects: AtomicUsize,
     drops: AtomicUsize,
     callback_running: AtomicBool,
     callback_returned: AtomicBool,
     freed_while_running: AtomicBool,
+}
+
+/// Shared by the callback and the test; guarded by `BlockingState::gate`.
+#[derive(Default)]
+struct Gate {
+    entered: bool,
+    release: bool,
 }
 
 /// Blocks inside `connect` until the test releases it.
@@ -84,14 +90,13 @@ impl CustomControllerCallback for BlockingProbe {
         state.connects.fetch_add(1, Ordering::SeqCst);
         state.callback_running.store(true, Ordering::SeqCst);
 
-        *state.entered.lock().unwrap() = true;
+        let mut gate = state.gate.lock().unwrap();
+        gate.entered = true;
         state.wake.notify_all();
-
-        let mut release = state.release.lock().unwrap();
-        while !*release {
-            release = state.wake.wait(release).unwrap();
+        while !gate.release {
+            gate = state.wake.wait(gate).unwrap();
         }
-        drop(release);
+        drop(gate);
 
         state.callback_running.store(false, Ordering::SeqCst);
         state.callback_returned.store(true, Ordering::SeqCst);
@@ -156,19 +161,19 @@ fn destroy_waits_for_in_flight_callback() {
         .post_connection()
         .expect("post_connection should succeed");
 
-    let mut entered = state.entered.lock().unwrap();
-    while !*entered {
+    let mut gate = state.gate.lock().unwrap();
+    while !gate.entered {
         let (guard, timeout) = state
             .wake
-            .wait_timeout(entered, Duration::from_secs(5))
+            .wait_timeout(gate, Duration::from_secs(5))
             .unwrap();
-        entered = guard;
+        gate = guard;
         assert!(
             !timeout.timed_out(),
             "connect callback was never invoked for id {connect_id}"
         );
     }
-    drop(entered);
+    drop(gate);
 
     let (started_tx, started_rx) = mpsc::channel();
     let (dropped_tx, dropped_rx) = mpsc::channel();
@@ -194,8 +199,11 @@ fn destroy_waits_for_in_flight_callback() {
         "callback freed while native still uses it"
     );
 
-    *state.release.lock().unwrap() = true;
-    state.wake.notify_all();
+    {
+        let mut gate = state.gate.lock().unwrap();
+        gate.release = true;
+        state.wake.notify_all();
+    }
 
     dropped_rx
         .recv_timeout(Duration::from_secs(5))
