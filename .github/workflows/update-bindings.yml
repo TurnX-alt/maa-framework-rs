@@ -9,6 +9,10 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: update-bindings
+  cancel-in-progress: false
+
 jobs:
   check-upstream:
     runs-on: ubuntu-latest
@@ -27,19 +31,20 @@ jobs:
         run: |
           UPSTREAM_TAG=$(gh release list --repo MaaXYZ/MaaFramework \
             --exclude-drafts \
+            --exclude-pre-releases \
             --limit 1 \
             --json tagName \
             --jq '.[0].tagName')
           UPSTREAM_VERSION="${UPSTREAM_TAG#v}"
-          
+
           CURRENT_VERSION=$(grep '^version = ' maa-framework-sys/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          
+
           echo "upstream_version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
           echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-          
+
           echo "Upstream: $UPSTREAM_VERSION, Current: $CURRENT_VERSION"
           echo "Event: $GITHUB_EVENT_NAME"
-          
+
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "needs_update=true" >> $GITHUB_OUTPUT
           elif [ "$UPSTREAM_VERSION" != "$CURRENT_VERSION" ]; then
@@ -87,41 +92,88 @@ jobs:
             *) echo "Unsupported asset: $FILE"; exit 1 ;;
           esac
 
-          ROOT=$(find sdk -mindepth 1 -maxdepth 1 -type d | head -n 1)
-          [ -n "$ROOT" ] || ROOT=sdk
-          cp -R "$ROOT"/. install/
+          # Locate the directory that actually contains include/, instead of guessing
+          # the first subdirectory (the archive may be flat or nested).
+          INCLUDE_DIR=$(find sdk -maxdepth 4 -type d -name include -print -quit)
+          if [ -n "$INCLUDE_DIR" ]; then
+            SDKROOT=$(dirname "$INCLUDE_DIR")
+          else
+            SDKROOT=sdk
+          fi
+          cp -R "$SDKROOT"/. install/
+
+          test -f install/include/MaaFramework/Instance/MaaTasker.h || {
+            echo "SDK headers missing under install/include; MAA_SDK_PATH would be silently ignored by build.rs"
+            find sdk -maxdepth 3 -type d
+            exit 1
+          }
 
       - name: Update sys version in Cargo.toml
         run: |
           NEW_VERSION="${{ needs.check-upstream.outputs.upstream_version }}"
-          sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" maa-framework-sys/Cargo.toml
-          sed -i '' "s/maa-framework-sys = { path = \"maa-framework-sys\", version = \".*\" }/maa-framework-sys = { path = \"maa-framework-sys\", version = \"$NEW_VERSION\" }/" Cargo.toml
+
+          # Only the sys crate tracks the SDK version; the workspace package version is independent.
+          sed "s/^version = \".*\"/version = \"$NEW_VERSION\"/" maa-framework-sys/Cargo.toml > maa-framework-sys/Cargo.toml.tmp && mv maa-framework-sys/Cargo.toml.tmp maa-framework-sys/Cargo.toml
+          sed "s/maa-framework-sys = { path = \"maa-framework-sys\", version = \".*\" }/maa-framework-sys = { path = \"maa-framework-sys\", version = \"$NEW_VERSION\" }/" Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
+
+          grep -q "^version = \"$NEW_VERSION\"$" maa-framework-sys/Cargo.toml || { echo "sys version not updated"; exit 1; }
+          grep -q "maa-framework-sys = { path = \"maa-framework-sys\", version = \"$NEW_VERSION\" }" Cargo.toml || { echo "workspace dependency version not updated"; exit 1; }
 
       - name: Regenerate bindings (Static)
         env:
           MAA_SDK_PATH: ${{ github.workspace }}/install
         run: |
-          rm -rf target/debug/build/maa-framework-sys-*
+          cargo clean -p maa-framework-sys
 
           cargo build -p maa-framework-sys --features generate-bindings
 
-          cp target/debug/build/maa-framework-sys-*/out/bindings.rs maa-framework-sys/src/bindings/static_bindings.rs
+          # Cargo 1.100.0 changed the build-dir layout from
+          #   target/debug/build/<pkg>-<hash>/out/   to   target/debug/build/<pkg>/<hash>/out/
+          # so a hardcoded <pkg>-* glob silently matches nothing. Discover the file instead.
+          SRC=$(find target/debug/build -type f -path '*/out/bindings.rs' | head -n 1)
+          if [ -z "$SRC" ]; then
+            echo "bindings.rs not found under target/debug/build"
+            find target/debug/build -maxdepth 4 -type d
+            exit 1
+          fi
+          if grep -q "CompositeLibrary" "$SRC"; then
+            echo "static step picked up dynamic bindings: $SRC"
+            exit 1
+          fi
+          cp "$SRC" maa-framework-sys/src/bindings/static_bindings.rs
 
       - name: Regenerate dynamic bindings
         env:
           MAA_SDK_PATH: ${{ github.workspace }}/install
         run: |
-          rm -rf target/debug/build/maa-framework-sys-*
+          cargo clean -p maa-framework-sys
 
           cargo build -p maa-framework-sys --features generate-bindings,dynamic
 
-          for dir in target/debug/build/maa-framework-sys-*/out; do
-            if [ -f "$dir/bindings.rs" ] && grep -q "CompositeLibrary" "$dir/bindings.rs"; then
-              cp "$dir/bindings.rs" maa-framework-sys/src/bindings/dynamic_bindings.rs
-              cp "$dir/shims.rs" maa-framework-sys/src/bindings/shims.rs
+          FOUND=0
+          find target/debug/build -type f -path '*/out/bindings.rs' > bindings-list.txt
+          while IFS= read -r f; do
+            if grep -q "CompositeLibrary" "$f"; then
+              d=$(dirname "$f")
+              if [ ! -f "$d/shims.rs" ]; then
+                echo "shims.rs missing next to $f"
+                exit 1
+              fi
+              cp "$f" maa-framework-sys/src/bindings/dynamic_bindings.rs
+              cp "$d/shims.rs" maa-framework-sys/src/bindings/shims.rs
+              FOUND=1
               break
             fi
-          done
+          done < bindings-list.txt
+          rm -f bindings-list.txt
+
+          # A zero-match loop used to exit 0 here, producing a green run with
+          # dynamic bindings unchanged.
+          if [ "$FOUND" != "1" ]; then
+            echo "no dynamic bindings (CompositeLibrary) produced"
+            find target/debug/build -maxdepth 4 -type d
+            exit 1
+          fi
 
       - name: Check changes
         id: changes
@@ -143,11 +195,11 @@ jobs:
           title: "feat(sys): update bindings for MaaFramework v${{ needs.check-upstream.outputs.upstream_version }}"
           body: |
             Automatically generated PR to update `maa-framework-sys` bindings.
-            
+
             **Changes:**
             - Updated version: `${{ needs.check-upstream.outputs.current_version }}` → `${{ needs.check-upstream.outputs.upstream_version }}`
             - Regenerated FFI bindings (static and dynamic)
-            
+
             Please review and merge to publish the new version.
           branch: update-sys-${{ needs.check-upstream.outputs.upstream_version }}
           delete-branch: true
